@@ -1,7 +1,7 @@
 import torch
 from torch.optim import Adam
 from data import get_loaders
-from data_generation_energy import generate_energy_distribution, sequence_log_likelihood, sample_sequences
+from data_generation_energy import generate_energy_distribution, sequence_log_likelihood, sample_sequences, save_energy_distribution, load_energy_distribution, get_noised_fitness
 import numpy as np
 from model import MaskedLanguageModel
 import sys
@@ -13,9 +13,28 @@ import itertools
 import matplotlib.pyplot as plt
 
 
+
+import time
+last_call_time = None
+def get_time_since_last_call():
+    global last_call_time
+    current_time = time.time()
+    
+    if last_call_time is None:
+        elapsed = None  # First call has no previous timestamp
+    else:
+        elapsed = current_time - last_call_time
+    
+    last_call_time = current_time
+    return elapsed
+get_time_since_last_call()
+
+
+
 def train(energy_params, model_type='mlm', num_epochs=30, num_samples=10000, batch_size=256,
-          mlm_embedding_dim=128, mlm_hidden_dim=256, mlm_test_prob=0.15,
-          mlm_mask_token_ratio=0.8, mlm_random_token_ratio=0.1, gpu=0, uniform_masking=False):
+          mlm_embedding_dim=128, mlm_hidden_dim=256, mlm_num_layers=4, mlm_test_prob=0.15,
+          mlm_mask_token_ratio=0.8, mlm_random_token_ratio=0.1, gpu=0, uniform_masking=False,
+          generator=None):
     device = torch.device('cuda:'+str(gpu) if torch.cuda.is_available() else 'cpu')
     alphabet_size = energy_params['alphabet_size']
 
@@ -25,7 +44,8 @@ def train(energy_params, model_type='mlm', num_epochs=30, num_samples=10000, bat
         model = MaskedLanguageModel(
             alphabet_size=alphabet_size,
             embedding_dim=mlm_embedding_dim,
-            hidden_dim=mlm_hidden_dim
+            hidden_dim=mlm_hidden_dim,
+            num_layers=mlm_num_layers
         ).to(device)
     else:
         raise ValueError("Invalid model_type. Choose 'markov' or 'mlm'.")
@@ -42,10 +62,17 @@ def train(energy_params, model_type='mlm', num_epochs=30, num_samples=10000, bat
         test_prob=mlm_test_prob,
         mask_token_ratio=mlm_mask_token_ratio,
         random_token_ratio=mlm_random_token_ratio,
-        uniform_masking=uniform_masking
+        uniform_masking=uniform_masking,
+        generator=generator
     )
-    print("Beggining Training", file=sys.stderr)
 
+    num_train_samples = len(train_loader.dataset)
+    num_val_samples = len(val_loader.dataset)
+    print(f"Training on {num_train_samples} samples, validating on {num_val_samples} samples", file=sys.stderr)
+    
+    
+    print("Beggining Training", file=sys.stderr)
+    get_time_since_last_call()
     for epoch in range(num_epochs):
         model.train()
         train_loss = 0
@@ -112,7 +139,8 @@ def train(energy_params, model_type='mlm', num_epochs=30, num_samples=10000, bat
         
         print(f"Epoch {epoch+1}/{num_epochs} | "
               f"Train Loss: {train_loss/len(train_loader):.4f} | "
-              f"Val Loss: {val_loss/len(val_loader):.4f}", 
+              f"Val Loss: {val_loss/len(val_loader):.4f} | "
+              f"Time Taken: {get_time_since_last_call():.2f}s", 
               file=sys.stderr)
     
     return model
@@ -167,7 +195,6 @@ def validate_mlm(model, energy_params, args, num_samples=100):
         
         accuracy = correct / total_masked
         avg_kl = np.mean(kl_divergences)
-        
         
         #print(f"Average KL Divergence: {avg_kl:.4f}", file=sys.stdout)
         print("Results", avg_kl, accuracy, args.mlm_test_prob, args.mlm_mask_token_ratio, 
@@ -268,7 +295,7 @@ def mutate_sequence(sequence, num_mutations, alphabet_size):
     return sequence, positions
 
 
-def assay_scoring(model, energy_params, args, mutations=2, num_samples=100):
+def assay_scoring(model, energy_params, args, mutations=2, num_samples=100, fitness_noise_level=0):
     """
     Compare multiple scoring methods against analytic likelihood ratios.
     
@@ -289,7 +316,10 @@ def assay_scoring(model, energy_params, args, mutations=2, num_samples=100):
             'mutant_context': [],
             'pseudo_likelihood': [],
             'generation_likelihood': [],
-            'shared_decoding': []
+            'generation_likelihood_greedy_path': [],
+            'shared_decoding': [],
+            'wildtype_marginal': [],
+            'mutant_marginal': []
         }
     }
 
@@ -305,15 +335,20 @@ def assay_scoring(model, energy_params, args, mutations=2, num_samples=100):
         original = np.array(samples[i])
         mutated, mut_positions = mutate_sequence(original, mutations, alphabet_size)
         
-        # Calculate analytic log likelihood ratio
-        log_p_original = sequence_log_likelihood(original, energy_params)
-        log_p_mutated = sequence_log_likelihood(mutated, energy_params)
-        results['truth'].append(log_p_mutated - log_p_original)
+        # Calculate analytic sequence fitness
+        fitness_original = get_noised_fitness(original, energy_params, fitness_noise_level)
+        fitness_mutated = get_noised_fitness(mutated, energy_params, fitness_noise_level)
+        results['truth'].append(fitness_mutated - fitness_original)
 
         # Generation likelihood scores
         gen_original = generation_likelihood(model, original, alphabet_size, device)
         gen_mutated = generation_likelihood(model, mutated, alphabet_size, device)
         results['scores']['generation_likelihood'].append(gen_mutated - gen_original)
+
+        # Greedy generation likelihood scores
+        gen_original = generation_likelihood_greedy_path(model, original, alphabet_size, device)
+        gen_mutated = generation_likelihood_greedy_path(model, mutated, alphabet_size, device)
+        results['scores']['generation_likelihood_greedy_path'].append(gen_mutated - gen_original)
         
         # Calculate all model scores
         results['scores']['path_chaining'].append(
@@ -334,6 +369,12 @@ def assay_scoring(model, energy_params, args, mutations=2, num_samples=100):
         results['scores']['shared_decoding'].append(
             shared_decoding_score(model, original, mutated, alphabet_size, device)
         )
+        results['scores']['wildtype_marginal'].append(
+            score_wildtype_marginal(model, original, mutated, mut_positions, alphabet_size, device)
+        )
+        results['scores']['mutant_marginal'].append(
+            score_mutant_marginal(model, original, mutated, mut_positions, alphabet_size, device)
+        )
     
     # Calculate correlations
     truth = np.array(results['truth'])
@@ -348,8 +389,7 @@ def assay_scoring(model, energy_params, args, mutations=2, num_samples=100):
 
     
     # Print results
-
-    print("EnergyDist", "M="+str(mutations),"seed="+str(args.seed), file=sys.stdout, sep='\t', end='\t', flush=True)
+    print("EnergyDist", "noise="+str(fitness_noise_level), "M="+str(mutations),"seed="+str(args.seed), "mask_ratio="+str(args.mlm_mask_token_ratio), "random_ratio="+str(args.mlm_random_token_ratio), file=sys.stdout, sep='\t', end='\t', flush=True)
     for method in correlations.keys():
         corr = correlations[method]
         mse = MSE[method]
@@ -359,7 +399,8 @@ def assay_scoring(model, energy_params, args, mutations=2, num_samples=100):
     return {
         'truth': truth,
         'scores': results['scores'],
-        'correlations': correlations
+        'correlations': correlations,
+        'MSE': MSE
     }
 
 # New scoring functions
@@ -634,7 +675,38 @@ def score_hamming_path(model, original, mutated, positions, alphabet_size, devic
     return total_score / len(permutations)  # Average across paths
 
 
+def score_wildtype_marginal(model, original, mutated, positions, alphabet_size, device):
 
+    seq_tensor = torch.tensor(original).to(device)
+    # Get model predictions
+    with torch.no_grad():
+        logits = model(seq_tensor.unsqueeze(0))
+    
+    # Calculate log ratio at each position
+    total_log_ratio = 0.0
+    for pos in positions:
+        log_probs = F.log_softmax(logits[0, pos], dim=-1)
+        log_ratio = (log_probs[mutated[pos]] - log_probs[original[pos]]).item()
+        total_log_ratio += log_ratio
+
+    return total_log_ratio
+
+
+def score_mutant_marginal(model, original, mutated, positions, alphabet_size, device):
+
+    seq_tensor = torch.tensor(mutated).to(device)
+    # Get model predictions
+    with torch.no_grad():
+        logits = model(seq_tensor.unsqueeze(0))
+    
+    # Calculate log ratio at each position
+    total_log_ratio = 0.0
+    for pos in positions:
+        log_probs = F.log_softmax(logits[0, pos], dim=-1)
+        log_ratio = (log_probs[mutated[pos]] - log_probs[original[pos]]).item()
+        total_log_ratio += log_ratio
+
+    return total_log_ratio
 
 
 
@@ -818,6 +890,8 @@ def main():
                       help='Embedding dimension for MLM')
     parser.add_argument('--mlm_hidden_dim', type=int, default=256,
                       help='Hidden dimension for MLM')
+    parser.add_argument('--mlm_num_layers', type=int, default=4,
+                      help='Number of layers for MLM')
     
     parser.add_argument('--uniform_masking', action='store_true',
                       help='Use uniform random number of masks (0 to L)')
@@ -840,18 +914,35 @@ def main():
                       help='GPU num to use')
     args = parser.parse_args()
 
+    # Set all random seeds for reproducibility
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
     random.seed(args.seed)
     
+    # Make PyTorch operations deterministic
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+    
+    # Set CUDA random seed if using GPU
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(args.seed)
+        torch.cuda.manual_seed_all(args.seed)
+    
+    # Create a generator for reproducible shuffling
+    g = torch.Generator()
+    g.manual_seed(args.seed)
+    
     # Generate Energy dist
     L = 10
     alphabet_size = 5
-    energy_params = generate_energy_distribution(
+    energy_params = generate_energy_distribution( #Energy distribution is deterministic with seed
         L=L,
         alphabet_size=alphabet_size,
         upper_range=3
     )
+
+    validation_set = sample_sequences(energy_params, 100)
+    validation_set_log_p = [sequence_log_likelihood(seq, energy_params) for seq in validation_set]
     
     # Train model
     model = train(energy_params, model_type=args.model_type,
@@ -859,20 +950,24 @@ def main():
                  num_samples=args.num_samples,
                  mlm_embedding_dim=args.mlm_embedding_dim,
                  mlm_hidden_dim=args.mlm_hidden_dim,
+                 mlm_num_layers=args.mlm_num_layers,
                  mlm_test_prob=args.mlm_test_prob,
                  mlm_mask_token_ratio=args.mlm_mask_token_ratio,
                  mlm_random_token_ratio=args.mlm_random_token_ratio,
                  gpu=args.gpu,
-                 uniform_masking=args.uniform_masking)
+                 uniform_masking=args.uniform_masking,
+                 generator=g)
 
+    
     # Validation
     if args.model_type == 'markov':
         exit()
     else:
 
-        for i in range(100):
-            visualize_two_site_spectrum(model, energy_params, images_dir=f"images")
-
+        for fitness_noise_level in [0.0, 1.0, 2.0, 3.0, 4.0, 5.0]:
+            for m in range(L):
+                assay_scoring(model, energy_params, args, mutations=m+1, num_samples=100, fitness_noise_level=fitness_noise_level)
+        
         exit()
 
         #validate_mlm(model, energy_params, args, num_samples=2)
@@ -905,7 +1000,7 @@ def main():
 
         # Subplot 1
         plt.subplot(1, 3, 1)
-        plt.scatter(results['truth'], results['scores']['generation_likelihood'], label='Generation Likelihood', s=1)
+        plt.scatter(results['truth'], results['scores']['generation_likelihood'], label=f"Generation Likelihood corr: {results['correlations']['generation_likelihood']:.4f}", s=1)
         plt.plot([min_val, max_val], [min_val, max_val], 'k--', label='y = x')  # Dashed y = x line
         plt.xlabel('Truth')
         plt.ylabel('Score')
@@ -913,7 +1008,7 @@ def main():
 
         # Subplot 2
         plt.subplot(1, 3, 2)
-        plt.scatter(results['truth'], results['scores']['generation_likelihood_greedy_path'], label='Greedy Generation Likelihood', s=1)
+        plt.scatter(results['truth'], results['scores']['generation_likelihood_greedy_path'], label=f"Greedy Generation Likelihood corr: {results['correlations']['generation_likelihood_greedy_path']:.4f}", s=1)
         plt.plot([min_val, max_val], [min_val, max_val], 'k--', label='y = x')
         plt.xlabel('Truth')
         plt.ylabel('Score')
@@ -921,7 +1016,7 @@ def main():
 
         # Subplot 3
         plt.subplot(1, 3, 3)
-        plt.scatter(results['truth'], results['scores']['pseudo_likelihood'], label='Pseudo Likelihood', s=1)
+        plt.scatter(results['truth'], results['scores']['pseudo_likelihood'], label=f"Pseudo Likelihood corr: {results['correlations']['pseudo_likelihood']:.4f}", s=1)
         plt.plot([min_val, max_val], [min_val, max_val], 'k--', label='y = x')
         plt.xlabel('Truth')
         plt.ylabel('Score')
@@ -930,8 +1025,12 @@ def main():
         # Save figure
         plt.savefig('single_sequence_scoring.png')
 
-        #for m in range(L):
-            #assay_scoring(model, energy_params, args, mutations=m+1, num_samples=1000)
+        exit()
+
+        for i in range(10):
+            visualize_two_site_spectrum(model, energy_params, images_dir=f"images")
+
+        
 
 
 if __name__ == "__main__":

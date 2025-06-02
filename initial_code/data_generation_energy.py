@@ -3,6 +3,9 @@ from collections import defaultdict
 import itertools
 from scipy.special import logsumexp
 import time
+import pickle
+import zlib
+from scipy.stats import norm
 
 def seconds_since_last_call():
     now = time.perf_counter()
@@ -69,6 +72,16 @@ def sequence_log_likelihood(sequence, energy_dist):
     return unnormalized_log_likelihood - energy_dist["log_Z"]
 
 
+#Fitness is the log likelihood of the sequence + noise
+# This noise is deterministic with seed + sequence 
+def get_noised_fitness(sequence, energy_dist, noise_level=0.1):
+    fitness = sequence_log_likelihood(sequence, energy_dist)
+    if noise_level == 0:
+        return fitness
+    sequence_hash_between_0_and_1 = zlib.crc32(sequence.tobytes()) / 2**32
+    noise = norm.ppf(sequence_hash_between_0_and_1, 0, noise_level)
+    return fitness + noise
+
 
 def sample_sequences(energy_dist, N=10000):
     """Exact sampling via inverse transform sampling"""
@@ -92,86 +105,21 @@ def sample_sequences(energy_dist, N=10000):
     return sorted_sequences[idx]
 
 
-def test_sampling_coherence(energy_dist, n_samples=100000, n_test_sequences=1000):
-    """
-    Test if sampled sequences follow the theoretical distribution.
-    
-    Args:
-        energy_dist: The energy distribution dictionary
-        n_samples: Number of sequences to sample
-        n_test_sequences: Number of sequences to test against
-        
-    Returns:
-        dict: Test results including chi-square statistic and p-value
-    """
-    # Sample sequences
-    sampled_sequences = sample_sequences(energy_dist, N=n_samples)
-    
-    # Convert sequences to tuples for hashing
-    sampled_sequences = [tuple(s) for s in sampled_sequences]
-    
-    # Count empirical frequencies
-    empirical_counts = defaultdict(int)
-    for seq in sampled_sequences:
-        empirical_counts[seq] += 1
-    
-    # Get theoretical probabilities for the sampled sequences
-    theoretical_probs = {}
-    for seq in empirical_counts.keys():
-        theoretical_probs[seq] = np.exp(sequence_log_likelihood(seq, energy_dist))
-    
-    # Normalize theoretical probabilities
-    total_prob = sum(theoretical_probs.values())
-    theoretical_probs = {k: v/total_prob for k, v in theoretical_probs.items()}
-    
-    # Calculate expected counts
-    expected_counts = {seq: prob * n_samples for seq, prob in theoretical_probs.items()}
-    
-    # Print diagnostic information
-    print("\nDiagnostic Information:")
-    print(f"Total number of unique sequences sampled: {len(empirical_counts)}")
-    print(f"Total theoretical probability mass of sampled sequences: {total_prob}")
-    
-    # Find sequences with largest discrepancies
-    discrepancies = []
-    for seq in empirical_counts:
-        expected = expected_counts[seq]
-        observed = empirical_counts[seq]
-        if expected > 0:  # Only consider sequences with non-zero expected probability
-            discrepancy = abs(observed - expected) / expected
-            discrepancies.append((seq, discrepancy, observed, expected))
-    
-    # Sort by discrepancy and show top 5
-    discrepancies.sort(key=lambda x: x[1], reverse=True)
-    print("\nTop 5 sequences with largest discrepancies (sequence, relative error, observed, expected):")
-    for seq, disc, obs, exp in discrepancies[:5]:
-        print(f"Sequence: {seq}, Relative Error: {disc:.2f}, Observed: {obs}, Expected: {exp:.2f}")
-    
-    # Calculate chi-square statistic
-    chi_square = 0
-    for seq in empirical_counts:
-        expected = expected_counts[seq]
-        observed = empirical_counts[seq]
-        if expected > 0:  # Only include sequences with non-zero expected probability
-            chi_square += (observed - expected)**2 / expected
-    
-    # Calculate degrees of freedom (number of categories - 1)
-    df = len(empirical_counts) - 1
-    
-    # Calculate p-value using chi-square distribution
-    from scipy.stats import chi2
-    p_value = 1 - chi2.cdf(chi_square, df)
-    
-    return {
-        'chi_square': chi_square,
-        'p_value': p_value,
-        'degrees_of_freedom': df,
-        'n_sequences_tested': len(empirical_counts)
-    }
 
 def sort_sequences(sequences):
     sort_indices = np.lexsort(sequences[:, ::-1].T)
     return sequences[sort_indices]
+
+
+
+def save_energy_distribution(energy_dist, filename):
+    with open(filename, 'wb') as f:
+        pickle.dump(energy_dist, f)
+
+def load_energy_distribution(filename):
+    with open(filename, 'rb') as f:
+        return pickle.load(f)
+
 
 
 def see_all_sequences_compare(energy_dist, number_of_samples=100000):
@@ -225,9 +173,19 @@ if __name__ == "__main__":
     print()
     print(ed["log_Z"])
 
-    print("\nTesting sampling coherence...")
-    test_results = test_sampling_coherence(ed)
-    print("Test results:", test_results)
+    #print("\nTesting sampling coherence...") #LLM nonsense dont listen to it
+    #test_results = test_sampling_coherence(ed)#
+    #print("Test results:", test_results)
+
+    print("Checking noise consistency...")
+
+    print(sequence_log_likelihood(np.array([0,0,0,0,0]), ed))
+    print(sequence_log_likelihood(np.array([0,0,0,0,1]), ed))
+    print(get_noised_fitness(np.array([0,0,0,0,0]), ed, noise_level=0.1))
+    print(get_noised_fitness(np.array([0,0,0,0,0]), ed, noise_level=0.1))
+    print(get_noised_fitness(np.array([0,0,0,0,1]), ed, noise_level=0.1))
+    print(get_noised_fitness(np.array([0,0,0,0,1]), ed, noise_level=0.1))
+    print("Checking noise consistency done")
 
     print("Checking all sequences")
     see_all_sequences_compare(ed, number_of_samples=100000)
