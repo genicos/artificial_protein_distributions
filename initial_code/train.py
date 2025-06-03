@@ -912,6 +912,10 @@ def main():
     
     parser.add_argument('--gpu', type=int, default=0,
                       help='GPU num to use')
+    
+    parser.add_argument('--distribution_parameter', type=float, default=3.0,
+                      help='Distribution parameter')
+    
     args = parser.parse_args()
 
     # Set all random seeds for reproducibility
@@ -938,7 +942,7 @@ def main():
     energy_params = generate_energy_distribution( #Energy distribution is deterministic with seed
         L=L,
         alphabet_size=alphabet_size,
-        upper_range=3
+        upper_range=args.distribution_parameter
     )
 
     validation_set = sample_sequences(energy_params, 100)
@@ -964,7 +968,7 @@ def main():
         exit()
     else:
 
-        for fitness_noise_level in [0.0, 1.0, 2.0, 3.0, 4.0, 5.0]:
+        for fitness_noise_level in [0.0]:
             for m in range(L):
                 assay_scoring(model, energy_params, args, mutations=m+1, num_samples=100, fitness_noise_level=fitness_noise_level)
         
