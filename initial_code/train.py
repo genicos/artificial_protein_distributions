@@ -214,7 +214,7 @@ def validate_mlm(model, energy_params, args, num_samples=100):
 
 
 
-def single_sequence_scoring(model, energy_params, args, num_samples=100):
+def single_sequence_scoring(model, energy_params, args, num_samples=100, fitness_distribution_params=None):
     """
     Score individual sequences using model-based and analytic (true) likelihoods.
     Returns:
@@ -234,15 +234,30 @@ def single_sequence_scoring(model, energy_params, args, num_samples=100):
         }
     }
 
-    samples = sample_sequences(energy_params, num_samples)
+    if args.something_or_nothing_fitness:
+        samples = sample_sequences(fitness_distribution_params, num_samples)
+    else:
+        samples = sample_sequences(energy_params, num_samples)
+    
+    
 
     for i in range(num_samples):
         if i % 10 == 0:
             print(i, file=sys.stderr)
         seq = np.array(samples[i])
+
         # Analytic log likelihood
         log_p = sequence_log_likelihood(seq, energy_params)
-        results['truth'].append(log_p)
+
+
+        if args.something_or_nothing_fitness:
+            fitness = sequence_log_likelihood(seq, fitness_distribution_params)
+            if log_p < args.death_threshold:
+                fitness = args.dead_fitness
+        else:
+            fitness = log_p
+        
+        results['truth'].append(fitness)
 
         # Generation likelihood score
         gen_score = generation_likelihood(model, seq, alphabet_size, device, paths=10)
@@ -295,7 +310,7 @@ def mutate_sequence(sequence, num_mutations, alphabet_size):
     return sequence, positions
 
 
-def assay_scoring(model, energy_params, args, mutations=2, num_samples=100, fitness_noise_level=0):
+def assay_scoring(model, energy_params, args, mutations=2, num_samples=100, fitness_noise_level=0, fitness_distribution_params=None):
     """
     Compare multiple scoring methods against analytic likelihood ratios.
     
@@ -306,6 +321,7 @@ def assay_scoring(model, energy_params, args, mutations=2, num_samples=100, fitn
         - 'correlations': Pearson correlations for each method
     """
     device = next(model.parameters()).device
+    L = energy_params['L']
     alphabet_size = energy_params['alphabet_size']
     results = {
         'truth': [],
@@ -323,7 +339,12 @@ def assay_scoring(model, energy_params, args, mutations=2, num_samples=100, fitn
         }
     }
 
-    samples = sample_sequences(energy_params, num_samples)
+    if args.something_or_nothing_fitness:
+        samples = sample_sequences(fitness_distribution_params, num_samples)
+    else:
+        samples = sample_sequences(energy_params, num_samples)
+
+
     
     for i in range(num_samples):
         
@@ -336,8 +357,19 @@ def assay_scoring(model, energy_params, args, mutations=2, num_samples=100, fitn
         mutated, mut_positions = mutate_sequence(original, mutations, alphabet_size)
         
         # Calculate analytic sequence fitness
-        fitness_original = get_noised_fitness(original, energy_params, fitness_noise_level)
-        fitness_mutated = get_noised_fitness(mutated, energy_params, fitness_noise_level)
+        if args.something_or_nothing_fitness:
+            LL_original = sequence_log_likelihood(original, energy_params)
+            LL_mutated = sequence_log_likelihood(mutated, energy_params)
+            fitness_original = sequence_log_likelihood(original, fitness_distribution_params)
+            fitness_mutated = sequence_log_likelihood(mutated, fitness_distribution_params)
+
+            if LL_original < args.death_threshold:
+                fitness_original = args.dead_fitness
+            if LL_mutated < args.death_threshold:
+                fitness_mutated = args.dead_fitness
+        else:
+            fitness_original = get_noised_fitness(original, energy_params, fitness_noise_level)
+            fitness_mutated = get_noised_fitness(mutated, energy_params, fitness_noise_level)
         results['truth'].append(fitness_mutated - fitness_original)
 
         # Generation likelihood scores
@@ -916,6 +948,15 @@ def main():
     parser.add_argument('--distribution_parameter', type=float, default=3.0,
                       help='Distribution parameter')
     
+    parser.add_argument('--something_or_nothing_fitness', action='store_true',
+                      help='If true, fitness is unrelated to likelihood, unless likeihood is below a threshold')
+    
+    parser.add_argument('--death_threshold', type=float, default=-10,
+                      help='If likelihood is below this threshold, fitness is dead fitness')
+    
+    parser.add_argument('--dead_fitness', type=float, default=-20,
+                      help='Fitness of dead proteins')
+    
     args = parser.parse_args()
 
     # Set all random seeds for reproducibility
@@ -962,21 +1003,33 @@ def main():
                  uniform_masking=args.uniform_masking,
                  generator=g)
 
+
+    
     
     # Validation
     if args.model_type == 'markov':
         exit()
     else:
+        if args.something_or_nothing_fitness:
+            fitness_distribution_params = generate_energy_distribution(
+                L=L,
+                alphabet_size=alphabet_size,
+                upper_range=args.distribution_parameter
+            )
+        else:
+            fitness_distribution_params = None
 
+        
         for fitness_noise_level in [0.0]:
             for m in range(L):
-                assay_scoring(model, energy_params, args, mutations=m+1, num_samples=100, fitness_noise_level=fitness_noise_level)
+                assay_scoring(model, energy_params, args, mutations=m+1, num_samples=100, fitness_noise_level=fitness_noise_level, fitness_distribution_params=fitness_distribution_params)
         
         exit()
+        
 
         #validate_mlm(model, energy_params, args, num_samples=2)
         print("Single Sequence Scoring", flush=True)
-        results = single_sequence_scoring(model, energy_params, args, num_samples=1000)
+        results = single_sequence_scoring(model, energy_params, args, num_samples=1000, fitness_distribution_params=fitness_distribution_params)
         print("Finished Single Sequence Scoring", flush=True)
         gen_ll_mean_square_error = np.mean((results['truth'] - results['scores']['generation_likelihood'])**2)
         gen_ll_greedy_mean_square_error = np.mean((results['truth'] - results['scores']['generation_likelihood_greedy_path'])**2)

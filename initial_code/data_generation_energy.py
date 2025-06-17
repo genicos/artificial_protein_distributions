@@ -165,6 +165,7 @@ if __name__ == "__main__":
     seconds_since_last_call()
     # Generate chain with higher sparsity for clearer patterns
     ed = generate_energy_distribution(L=L, alphabet_size=alphabet_size, upper_range=3)
+    #usually upper range is 3
     
     print("Seconds to generate", seconds_since_last_call())
     print(ed["order_1_effects"])
@@ -178,13 +179,14 @@ if __name__ == "__main__":
     #print("Test results:", test_results)
 
     print("Checking noise consistency...")
-
+    """
     print(sequence_log_likelihood(np.array([0,0,0,0,0]), ed))
     print(sequence_log_likelihood(np.array([0,0,0,0,1]), ed))
     print(get_noised_fitness(np.array([0,0,0,0,0]), ed, noise_level=0.1))
     print(get_noised_fitness(np.array([0,0,0,0,0]), ed, noise_level=0.1))
     print(get_noised_fitness(np.array([0,0,0,0,1]), ed, noise_level=0.1))
     print(get_noised_fitness(np.array([0,0,0,0,1]), ed, noise_level=0.1))
+    """
     print("Checking noise consistency done")
 
     print("Checking all sequences")
