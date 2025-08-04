@@ -1,0 +1,1304 @@
+import torch
+from torch.optim import Adam
+from data import get_loaders
+from data_generation_energy import generate_energy_distribution, sequence_log_likelihood, sample_sequences, save_energy_distribution, load_energy_distribution, get_noised_fitness
+import numpy as np
+from model import MaskedLanguageModel
+import sys
+import torch.nn.functional as F
+import argparse
+import random
+import math
+import itertools
+import matplotlib.pyplot as plt
+
+
+
+import time
+last_call_time = None
+def get_time_since_last_call():
+    global last_call_time
+    current_time = time.time()
+    
+    if last_call_time is None:
+        elapsed = None  # First call has no previous timestamp
+    else:
+        elapsed = current_time - last_call_time
+    
+    last_call_time = current_time
+    return elapsed
+get_time_since_last_call()
+
+
+
+def train(energy_params, num_epochs=30, num_samples=10000, batch_size=256,
+        mlm_embedding_dim=128, mlm_hidden_dim=256, mlm_num_layers=4, gpu=0,
+        generator=None, train_ratio=0.9):
+    
+    
+    device = torch.device('cuda:'+str(gpu) if torch.cuda.is_available() else 'cpu')
+    alphabet_size = energy_params['alphabet_size']
+
+    
+    model = MaskedLanguageModel(
+        alphabet_size=alphabet_size,
+        embedding_dim=mlm_embedding_dim,
+        hidden_dim=mlm_hidden_dim,
+        num_layers=mlm_num_layers
+    ).to(device)
+
+
+    lr=0.0001
+    optimizer = Adam(model.parameters(), lr=lr)
+
+    
+    
+    print("Simulating Data", file=sys.stderr)
+    # Get data loaders with BERT-style masking
+    train_loader, val_loader = get_loaders(
+        energy_params=energy_params,
+        batch_size=batch_size,
+        num_samples=num_samples,
+        generator=generator,
+        train_ratio=train_ratio
+    )
+
+    num_train_samples = len(train_loader.dataset)
+    num_val_samples = len(val_loader.dataset)
+    print(f"Training on {num_train_samples} samples, validating on {num_val_samples} samples", file=sys.stderr)
+    
+    
+    print("Beggining Training", file=sys.stderr)
+    get_time_since_last_call()
+    for epoch in range(num_epochs):
+        model.train()
+        train_loss = 0
+
+        total_tokens = 0
+        test_tokens = 0
+        mask_tokens_giv_test_token = 0
+        same_token_giv_test_token = 0
+        
+        for batch in train_loader:
+            if True:
+                masked_sequences, labels = batch
+                masked_sequences, labels = masked_sequences.to(device), labels.to(device)
+
+                """
+                print()
+                print(labels[0])
+                print(masked_sequences[0])
+                print()
+                for i in range(len(masked_sequences)):
+                    for j in range(len(masked_sequences[0])):
+                        total_tokens += 1
+                        if labels[i][j] != -1:
+                            test_tokens += 1
+
+                            if masked_sequences[i][j] == 5:
+                                mask_tokens_giv_test_token += 1
+                            elif masked_sequences[i][j]==labels[i][j]:
+                                same_token_giv_test_token += 1
+                """
+
+                optimizer.zero_grad()
+                logits = model(masked_sequences)
+                # Reshape for cross entropy: (batch*seq_len, alphabet_size) vs (batch*seq_len)
+                loss = F.cross_entropy(
+                    logits.view(-1, alphabet_size),
+                    labels.view(-1),
+                    ignore_index=-1  # Ignore non-masked positions
+                )
+            
+            loss.backward()
+            optimizer.step()
+            train_loss += loss.item()
+
+        # Validation
+        model.eval()
+        val_loss = 0
+        with torch.no_grad():
+            for batch in val_loader:
+                if True:
+                    masked_sequences, labels = batch
+                    masked_sequences, labels = masked_sequences.to(device), labels.to(device)
+                    logits = model(masked_sequences)
+                    loss = F.cross_entropy(
+                        logits.view(-1, alphabet_size),
+                        labels.view(-1),
+                        ignore_index=-1
+                    )
+                val_loss += loss.item()
+
+        divisor = len(val_loader)
+        if divisor == 0:
+            divisor = 1
+        print(f"Epoch {epoch+1}/{num_epochs} | "
+              f"Train Loss: {train_loss/len(train_loader):.4f} | "
+              f"Val Loss: {val_loss/divisor:.4f} | "
+              f"Time Taken: {get_time_since_last_call():.2f}s", 
+              file=sys.stderr)
+    
+    return model
+
+
+
+
+
+
+
+
+
+
+
+
+def validate_mlm(model, energy_params, args, num_samples=100):
+    """Validate MLM by comparing predictions to true distributions"""
+    device = next(model.parameters()).device
+    alphabet_size = energy_params['alphabet_size']
+    L = energy_params['L']
+    
+    model.eval()
+    with torch.no_grad():
+        # Track prediction accuracy
+        correct = 0
+        total_masked = 0
+        
+        # Track distribution distances
+        kl_divergences = []
+
+        sequences = sample_sequences(energy_params, num_samples)
+        
+        for i in range(num_samples):
+            # Generate test sequence
+            seq = np.array(sequences[i])
+            pos = np.random.choice(len(seq), size=1, replace=False)[0]
+            
+            # Create masked input
+            masked_seq = torch.tensor(seq).clone().unsqueeze(0).to(device)
+            masked_seq[0, pos] = alphabet_size  # Use alphabet_size as mask token
+            
+            # Get model prediction
+            logits = model(masked_seq)
+            pred_probs = F.softmax(logits[0, pos], dim=-1).cpu().numpy()
+            
+            # Calculate true distribution
+            true_probs = np.zeros(alphabet_size)
+            for s in range(alphabet_size):
+                temp_seq = seq.copy()
+                temp_seq[pos] = s
+                true_probs[s] = math.exp(sequence_log_likelihood(temp_seq, energy_params))
+            true_probs /= true_probs.sum()
+            
+            # Calculate accuracy
+            pred_token = pred_probs.argmax()
+            if pred_token == seq[pos]:
+                correct += 1
+            total_masked += 1
+            
+            # Calculate KL divergence
+            kl = np.sum(true_probs * np.log(true_probs / (pred_probs + 1e-10)))
+            kl_divergences.append(kl)
+        
+        accuracy = correct / total_masked
+        avg_kl = np.mean(kl_divergences)
+        
+        #print(f"Average KL Divergence: {avg_kl:.4f}", file=sys.stdout)
+        print("Results", avg_kl, accuracy, args.mlm_test_prob, args.mlm_mask_token_ratio, 
+            args.mlm_random_token_ratio, args.num_epochs, args.num_samples, args.seed, file=sys.stdout, sep='\t')
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+def single_sequence_scoring(model, energy_params, args, num_samples=100, fitness_distribution_params=None):
+    """
+    Score individual sequences using model-based and analytic (true) likelihoods.
+    Returns:
+        Dict containing:
+        - 'truth': Ground truth log likelihoods
+        - 'scores': Dict of scores for each method
+        - 'correlations': Pearson correlations for each method
+    """
+    device = next(model.parameters()).device
+    alphabet_size = energy_params['alphabet_size']
+    results = {
+        'truth': [],
+        'scores': {
+            'generation_likelihood': [],
+            'generation_likelihood_greedy_path': [],
+            'pseudo_likelihood': []
+        }
+    }
+
+    if args.something_or_nothing_fitness:
+        samples = sample_sequences(fitness_distribution_params, num_samples)
+    else:
+        samples = sample_sequences(energy_params, num_samples)
+    
+    
+
+    for i in range(num_samples):
+        if i % 10 == 0:
+            print(i, file=sys.stderr)
+        seq = np.array(samples[i])
+
+        # Analytic log likelihood
+        log_p = sequence_log_likelihood(seq, energy_params)
+
+
+        if args.something_or_nothing_fitness:
+            fitness = sequence_log_likelihood(seq, fitness_distribution_params)
+            if log_p < args.death_threshold:
+                fitness = args.dead_fitness
+        else:
+            fitness = log_p
+        
+        results['truth'].append(fitness)
+
+        # Generation likelihood score
+        gen_score = generation_likelihood(model, seq, alphabet_size, device, paths=10)
+        results['scores']['generation_likelihood'].append(gen_score)
+
+        # Greedy generation likelihood score
+        gen_score = generation_likelihood_greedy_path(model, seq, alphabet_size, device)
+        results['scores']['generation_likelihood_greedy_path'].append(gen_score)
+
+        # Pseudo likelihood score
+        pl_score = pseudo_likelihood(model, seq, alphabet_size, device)
+        results['scores']['pseudo_likelihood'].append(pl_score)
+
+    # Calculate correlations and MSE
+    truth = np.array(results['truth'])
+    correlations = {}
+    MSE = {}
+    for method in results['scores']:
+        pred = np.array(results['scores'][method])
+        correlations[method] = np.corrcoef(truth, pred)[0, 1]
+        MSE[method] = np.mean((truth - pred) ** 2)
+
+    # Print results
+    print("SingleSeqScoring", "seed="+str(args.seed), file=sys.stdout, sep='\t', end='\t', flush=True)
+    for method in correlations.keys():
+        corr = correlations[method]
+        mse = MSE[method]
+        print(f"{method}\t{corr:.4f}\t{mse:.4f}", end='\t', file=sys.stdout)
+    print(flush=True, file=sys.stdout)
+
+    return {
+        'truth': truth,
+        'scores': results['scores'],
+        'correlations': correlations
+    }
+
+
+
+
+
+def mutate_sequence(sequence, num_mutations, alphabet_size, allowed_positions=None):
+    """Apply random mutations to a sequence"""
+    sequence = sequence.copy()
+    if allowed_positions is None:
+        positions = np.random.choice(len(sequence), size=num_mutations, replace=False)
+    else:
+        positions = np.random.choice(allowed_positions, size=num_mutations, replace=False)
+    for pos in positions:
+        current = sequence[pos]
+        # Sample different amino acid
+        choices = [aa for aa in range(alphabet_size) if aa != current]
+        sequence[pos] = np.random.choice(choices)
+    return sequence, positions
+
+
+def assay_scoring(model, energy_params, args, mutations=2, num_samples=100, fitness_noise_level=0, fitness_distribution_params=None, positions_to_be_kept_masked=None):
+    """
+    Compare multiple scoring methods against analytic likelihood ratios.
+    
+    Returns:
+        Dict containing:
+        - 'truth': Ground truth log likelihood ratios
+        - 'scores': Dict of scores for each method
+        - 'correlations': Pearson correlations for each method
+    """
+    device = next(model.parameters()).device
+    L = energy_params['L']
+    alphabet_size = energy_params['alphabet_size']
+    results = {
+        'truth': [],
+        'scores': {
+            'path_chaining': [],
+            'masked_marginal': [],
+            'wildtype_context': [],
+            'mutant_context': [],
+            'pseudo_likelihood': [],
+            'generation_likelihood': [],
+            'generation_likelihood_greedy_path': [],
+            'shared_decoding': [],
+            'wildtype_marginal': [],
+            'mutant_marginal': []
+        }
+    }
+
+    if args.something_or_nothing_fitness:
+        samples = sample_sequences(fitness_distribution_params, num_samples)
+    else:
+        samples = sample_sequences(energy_params, num_samples)
+
+
+    
+    for i in range(num_samples):
+        
+        if i % 10 == 0:
+            #print(i, file=sys.stderr)
+            pass
+
+        # Generate original and mutated sequences
+        original = np.array(samples[i])
+
+        if positions_to_be_kept_masked:
+            complement_positions = [i for i in range(len(original)) if i not in positions_to_be_kept_masked]
+            mutated, mut_positions = mutate_sequence(original, mutations, alphabet_size, complement_positions)
+
+            
+        else:
+            mutated, mut_positions = mutate_sequence(original, mutations, alphabet_size)
+        
+        
+        # Calculate analytic sequence fitness
+        if args.something_or_nothing_fitness:
+            LL_original = sequence_log_likelihood(original, energy_params)
+            LL_mutated = sequence_log_likelihood(mutated, energy_params)
+            fitness_original = sequence_log_likelihood(original, fitness_distribution_params)
+            fitness_mutated = sequence_log_likelihood(mutated, fitness_distribution_params)
+
+            if LL_original < args.death_threshold:
+                fitness_original = args.dead_fitness
+            if LL_mutated < args.death_threshold:
+                fitness_mutated = args.dead_fitness
+        else:
+            fitness_original = get_noised_fitness(original, energy_params, fitness_noise_level)
+            fitness_mutated = get_noised_fitness(mutated, energy_params, fitness_noise_level)
+        results['truth'].append(fitness_mutated - fitness_original)
+
+
+        if positions_to_be_kept_masked:
+            for pos in positions_to_be_kept_masked:
+                mutated[pos] = alphabet_size
+                original[pos] = alphabet_size
+
+
+        if not positions_to_be_kept_masked:
+            # Generation likelihood scores
+            gen_original = generation_likelihood(model, original, alphabet_size, device)
+            gen_mutated = generation_likelihood(model, mutated, alphabet_size, device)
+            results['scores']['generation_likelihood'].append(gen_mutated - gen_original)
+
+            # Greedy generation likelihood scores
+            gen_original = generation_likelihood_greedy_path(model, original, alphabet_size, device)
+            gen_mutated = generation_likelihood_greedy_path(model, mutated, alphabet_size, device)
+            results['scores']['generation_likelihood_greedy_path'].append(gen_mutated - gen_original)
+
+            results['scores']['pseudo_likelihood'].append(
+                pseudo_likelihood_score(model, original, mutated, alphabet_size, device)
+            )
+        
+        # Calculate all model scores
+        results['scores']['path_chaining'].append(
+            score_hamming_path(model, original, mutated, mut_positions, alphabet_size, device)
+        )
+        results['scores']['masked_marginal'].append(
+            masked_marginal_score(model, original, mutated, mut_positions, alphabet_size, device)
+        )
+        results['scores']['wildtype_context'].append(
+            masked_marginal_wildtype_context_score(model, original, mutated, mut_positions, alphabet_size, device)
+        )
+        results['scores']['mutant_context'].append(
+            masked_marginal_mutant_context_score(model, original, mutated, mut_positions, alphabet_size, device)
+        )
+        results['scores']['shared_decoding'].append(
+            shared_decoding_score(model, original, mutated, alphabet_size, device)
+        )
+        results['scores']['wildtype_marginal'].append(
+            score_wildtype_marginal(model, original, mutated, mut_positions, alphabet_size, device)
+        )
+        results['scores']['mutant_marginal'].append(
+            score_mutant_marginal(model, original, mutated, mut_positions, alphabet_size, device)
+        )
+    
+    # Calculate correlations
+    truth = np.array(results['truth'])
+    correlations = {}
+    MSE = {}
+    for method in results['scores']:
+        pred = np.array(results['scores'][method])
+        #for i in range(len(truth)):
+        #    print(method,float(truth[i]), float(pred[i]))
+        if len(pred) > 0:
+            correlations[method] = np.corrcoef(truth, pred)[0, 1]
+            MSE[method] = np.mean((truth - pred) ** 2)
+
+    
+    # Print results
+    print("EnergyDist", "noise="+str(fitness_noise_level), "M="+str(mutations),"seed="+str(args.seed), "mask_ratio="+str(args.mlm_mask_token_ratio), "random_ratio="+str(args.mlm_random_token_ratio), file=sys.stdout, sep='\t', end='\t', flush=True)
+    for method in correlations.keys():
+        corr = correlations[method]
+        mse = MSE[method]
+        print(f"{method}\t{corr:.4f}\t{mse:.4f}", end='\t', file=sys.stdout)
+    print(flush=True, file=sys.stdout)
+
+    return {
+        'truth': truth,
+        'scores': results['scores'],
+        'correlations': correlations,
+        'MSE': MSE
+    }
+
+# New scoring functions
+def masked_marginal_score(model, original, mutated, positions, alphabet_size, device):
+    """Score all mutations simultaneously with full masking"""
+    masked = torch.tensor(original).to(device)
+    masked[positions] = alphabet_size
+    
+    with torch.no_grad():
+        logits = model(masked.unsqueeze(0))[0]
+    
+    score = 0.0
+    for pos in positions:
+        score += (logits[pos, mutated[pos]] - logits[pos, original[pos]]).item()
+    return score
+
+def masked_marginal_wildtype_context_score(model, original, mutated, positions, alphabet_size, device):
+    """Score each mutation in wildtype context"""
+    score = 0.0
+    for pos in positions:
+        # Create wildtype-masked sequence
+        masked = torch.tensor(original).to(device)
+        masked[pos] = alphabet_size
+        
+        with torch.no_grad():
+            logits = model(masked.unsqueeze(0))[0, pos]
+        
+        score += (logits[mutated[pos]] - logits[original[pos]]).item()
+    return score
+
+def masked_marginal_mutant_context_score(model, original, mutated, positions, alphabet_size, device):
+    """Score each mutation in mutant context"""
+    current = original.copy()
+    score = 0.0
+    
+    for pos in positions:
+        # Create mutant-masked sequence
+        masked = torch.tensor(mutated).to(device)
+        masked[pos] = alphabet_size
+        
+        with torch.no_grad():
+            logits = model(masked.unsqueeze(0))[0, pos]
+        
+        score += (logits[mutated[pos]] - logits[original[pos]]).item()
+    return score
+
+def pseudo_likelihood_score(model, original, mutated, alphabet_size, device):
+    """Calculate pseudo-likelihood ratio"""
+    def pl(sequence):
+        seq_tensor = torch.tensor(sequence).to(device)
+        pl_score = 0.0
+        
+        for pos in range(len(sequence)):
+            masked = seq_tensor.clone()
+            masked[pos] = alphabet_size
+            
+            with torch.no_grad():
+                logits = model(masked.unsqueeze(0))[0, pos]
+            
+            pl_score += logits[sequence[pos]].item()
+        return pl_score
+    
+    return pl(mutated) - pl(original)
+
+
+def pseudo_likelihood(model, sequence, alphabet_size, device):
+    """Calculate pseudo-likelihood"""
+    seq_tensor = torch.tensor(sequence).to(device)
+    pl_score = 0.0
+        
+    for pos in range(len(sequence)):
+        masked = seq_tensor.clone()
+        masked[pos] = alphabet_size
+            
+        with torch.no_grad():
+            logits = model(masked.unsqueeze(0))[0, pos]
+            
+        pl_score += F.log_softmax(logits, dim=-1)[sequence[pos]].item()
+    
+    return pl_score
+    
+
+def generation_likelihood(model, sequence, alphabet_size, device, paths=6):
+    """Calculate generation likelihood through progressive unmasking"""
+    seq_len = len(sequence)
+    total_log_prob = 0.0
+    seq_tensor = torch.tensor(sequence, dtype=torch.long).to(device)
+    
+    for _ in range(paths):
+        current = torch.full((seq_len,), alphabet_size, device=device)
+        remaining_pos = list(range(seq_len))
+        path_log_prob = 0.0
+        
+        while remaining_pos:
+            # Randomly select next position to unmask
+            idx = np.random.randint(len(remaining_pos))
+            pos = remaining_pos.pop(idx)
+            
+            # Get model predictions
+            with torch.no_grad():
+                logits = model(current.unsqueeze(0))[0, pos]
+            
+            # Add log probability of correct amino acid
+            path_log_prob += F.log_softmax(logits, dim=-1)[seq_tensor[pos]].item()
+            
+            # Update current sequence with revealed amino acid
+            current[pos] = seq_tensor[pos]
+        
+        total_log_prob += path_log_prob
+    
+    return total_log_prob / paths  # Average across paths
+
+
+def generation_likelihood_all_paths(model, sequence, alphabet_size, device):
+    """Calculate generation likelihood through all possible paths"""
+    seq_len = len(sequence)
+    total_log_prob = 0.0
+    seq_tensor = torch.tensor(sequence, dtype=torch.long).to(device)
+    
+    paths = list(itertools.permutations(range(seq_len)))
+    for path in paths:
+        current = torch.full((seq_len,), alphabet_size, device=device)
+        path_log_prob = 0.0
+        
+        for i in range(seq_len):
+            pos = path[i]
+            
+            with torch.no_grad():
+                logits = model(current.unsqueeze(0))[0, pos]
+            
+            path_log_prob += F.log_softmax(logits, dim=-1)[seq_tensor[pos]].item()
+            
+            current[pos] = seq_tensor[pos]
+            
+        total_log_prob += path_log_prob
+        
+    return total_log_prob / len(paths)
+            
+            
+            
+
+
+
+
+def generation_likelihood_greedy_path(model, sequence, alphabet_size, device):
+    """Calculate generation likelihood through greedy unmasking"""
+    seq_len = len(sequence)
+    total_log_prob = 0.0
+    seq_tensor = torch.tensor(sequence, dtype=torch.long).to(device)
+    
+    current = torch.full((seq_len,), alphabet_size, device=device)
+    remaining_pos = list(range(seq_len))
+    path_log_prob = 0.0
+    
+    while remaining_pos:
+        # Get model predictions
+        with torch.no_grad():
+            log_probs = F.log_softmax(model(current.unsqueeze(0))[0], dim=-1)
+        
+        # Select position with highest log probability of correct amino acid
+        max_log_prob = -float('inf')
+        for p in remaining_pos:
+            if log_probs[p, seq_tensor[p]] > max_log_prob:
+                max_log_prob = log_probs[p, seq_tensor[p]]
+                pos = p
+        remaining_pos.remove(pos)
+        
+        # Add log probability of correct amino acid
+        path_log_prob += max_log_prob.item()
+        
+        # Update current sequence with revealed amino acid
+        current[pos] = seq_tensor[pos]
+
+    return path_log_prob
+
+
+
+def shared_decoding_score(model, original, mutated, alphabet_size, device, paths=6):
+    """Compare sequences via shared masked decoding from common ancestor"""
+    # Identify differing positions
+    diff_positions = [i for i, (o, m) in enumerate(zip(original, mutated)) if o != m]
+    k = len(diff_positions)
+    if k == 0:
+        return 0.0  # Identical sequences
+    
+    # Create common sequence with shared positions revealed
+    common_seq = torch.full((len(original),), alphabet_size, device=device)
+    for i in range(len(original)):
+        if original[i] == mutated[i]:
+            common_seq[i] = original[i]
+    
+
+    total_paths = math.factorial(k)
+    
+    permutations = []
+    if total_paths <= paths:
+        permutations = list(itertools.permutations(diff_positions))
+    else:
+        # Sample without replacement up to paths
+        seen = set()
+        while len(permutations) < paths:
+            perm = tuple(np.random.permutation(diff_positions).tolist())
+            if perm not in seen:
+                seen.add(perm)
+                permutations.append(perm)
+    
+    paths = len(permutations)
+    
+    total_score = 0.0
+    for perm in permutations:
+        
+        # Decode towards original
+        current_o = common_seq.clone()
+        log_prob_o = 0.0
+        
+        # Decode towards mutated
+        current_m = common_seq.clone()
+        log_prob_m = 0.0
+        
+        for pos in perm:
+            # Decode original direction
+            masked_o = current_o.clone()
+            masked_o[pos] = alphabet_size
+            with torch.no_grad():
+                logits_o = model(masked_o.unsqueeze(0))[0, pos]
+            log_prob_o += F.log_softmax(logits_o, dim=-1)[original[pos]].item()
+            current_o[pos] = original[pos]
+            
+            # Decode mutated direction
+            masked_m = current_m.clone()
+            masked_m[pos] = alphabet_size
+            with torch.no_grad():
+                logits_m = model(masked_m.unsqueeze(0))[0, pos]
+            log_prob_m += F.log_softmax(logits_m, dim=-1)[mutated[pos]].item()
+            current_m[pos] = mutated[pos]
+        
+        total_score += (log_prob_m - log_prob_o)
+    
+    return total_score / paths
+
+
+
+
+
+
+
+def score_single_mutation(model, original, mutated, pos, alphabet_size, device):
+    """Score single mutation by masking the differing position"""
+    # Create masked sequence
+    masked = torch.tensor(original).to(device)
+    masked[pos] = alphabet_size  # Mask token
+    
+    # Get model predictions
+    with torch.no_grad():
+        logits = model(masked.unsqueeze(0))
+        log_probs = F.log_softmax(logits[0, pos], dim=-1)
+    
+    # Calculate log ratio
+    return (log_probs[mutated[pos]] - log_probs[original[pos]]).cpu().item()
+
+
+
+def score_hamming_path(model, original, mutated, positions, alphabet_size, device, paths=6):
+    """Score multiple mutations by sampling multiple Hamming paths"""
+    k = len(positions)
+    if k == 0:
+        return 0.0  # No mutations to score
+    
+    # Calculate total possible paths (k!)
+    total_paths = math.factorial(k)
+    permutations = []
+    
+    if total_paths <= paths:
+        # Use all possible paths
+        permutations = list(itertools.permutations(positions))
+    else:
+        # Sample random unique paths
+        seen = set()
+        while len(permutations) < paths:
+            perm = tuple(np.random.permutation(positions).tolist())
+            if perm not in seen:
+                seen.add(perm)
+                permutations.append(perm)
+    
+    total_score = 0.0
+    for perm in permutations:
+        current = original.copy()
+        path_score = 0.0
+        
+        for pos in perm:
+            intermediate = current.copy()
+            intermediate[pos] = mutated[pos]
+            
+            # Score this mutation step
+            step_score = score_single_mutation(
+                model, current, intermediate, pos, 
+                alphabet_size, device
+            )
+            path_score += step_score
+            current = intermediate
+            
+        total_score += path_score
+    
+    return total_score / len(permutations)  # Average across paths
+
+
+def score_wildtype_marginal(model, original, mutated, positions, alphabet_size, device):
+
+    seq_tensor = torch.tensor(original).to(device)
+    # Get model predictions
+    with torch.no_grad():
+        logits = model(seq_tensor.unsqueeze(0))
+    
+    # Calculate log ratio at each position
+    total_log_ratio = 0.0
+    for pos in positions:
+        log_probs = F.log_softmax(logits[0, pos], dim=-1)
+        log_ratio = (log_probs[mutated[pos]] - log_probs[original[pos]]).item()
+        total_log_ratio += log_ratio
+
+    return total_log_ratio
+
+
+def score_mutant_marginal(model, original, mutated, positions, alphabet_size, device):
+
+    seq_tensor = torch.tensor(mutated).to(device)
+    # Get model predictions
+    with torch.no_grad():
+        logits = model(seq_tensor.unsqueeze(0))
+    
+    # Calculate log ratio at each position
+    total_log_ratio = 0.0
+    for pos in positions:
+        log_probs = F.log_softmax(logits[0, pos], dim=-1)
+        log_ratio = (log_probs[mutated[pos]] - log_probs[original[pos]]).item()
+        total_log_ratio += log_ratio
+
+    return total_log_ratio
+
+
+
+import pandas as pd
+import seaborn as sns
+from scipy.stats import spearmanr, gaussian_kde
+import os
+
+def format_tick_labels(sorted_aas, original_aa):
+    # Return list of labels, bolding the original
+    return [f"{aa}" for aa in sorted_aas]
+
+def visualize_two_site_spectrum(model, energy_params, images_dir=None):
+    alphabet_size = energy_params['alphabet_size']
+    all_two_site_amino_acid_combinations = list(itertools.product(range(alphabet_size), repeat=2))
+
+    original_sequence = sample_sequences(energy_params, 1)[0]
+    L = len(original_sequence)
+    device = next(model.parameters()).device
+
+    # Randomly pick two positions
+    pos1 = np.random.randint(0, L)
+    pos2 = np.random.randint(0, L)
+    while pos2 == pos1:
+        pos2 = np.random.randint(0, L)
+
+    original_aa1 = original_sequence[pos1]
+    original_aa2 = original_sequence[pos2]
+
+    # Collect all data into a DataFrame
+    data = []
+    baseline_log_p = sequence_log_likelihood(original_sequence, energy_params)
+    baseline_generation_likelihood = generation_likelihood(model, original_sequence, alphabet_size, device)
+    baseline_generation_likelihood_greedy_path = generation_likelihood_greedy_path(model, original_sequence, alphabet_size, device)
+    baseline_pseudo_likelihood = pseudo_likelihood(model, original_sequence, alphabet_size, device)
+
+    for aa1, aa2 in all_two_site_amino_acid_combinations:
+        mutant = original_sequence.copy()
+        mutant[pos1] = aa1
+        mutant[pos2] = aa2
+
+        log_p_mutant = sequence_log_likelihood(mutant, energy_params)
+        truth = log_p_mutant - baseline_log_p
+        gen_ll = generation_likelihood(model, mutant, alphabet_size, device) - baseline_generation_likelihood
+        gen_ll_greedy = generation_likelihood_greedy_path(model, mutant, alphabet_size, device) - baseline_generation_likelihood_greedy_path
+        pl = pseudo_likelihood(model, mutant, alphabet_size, device) - baseline_pseudo_likelihood
+        pc = score_hamming_path(model, original_sequence, mutant, [pos1, pos2], alphabet_size, device)
+        mm = masked_marginal_score(model, original_sequence, mutant, [pos1, pos2], alphabet_size, device)
+        wtmm = masked_marginal_wildtype_context_score(model, original_sequence, mutant, [pos1, pos2], alphabet_size, device)
+        sd = shared_decoding_score(model, original_sequence, mutant, alphabet_size, device)
+
+        data.append({
+            'mut_aa1': aa1,
+            'mut_aa2': aa2,
+            'truth': truth,
+            'SD': sd,
+            'MM': mm,
+            'WTMM': wtmm,
+            'PC': pc,
+            'generation_likelihood': gen_ll,
+            'generation_likelihood_greedy_path': gen_ll_greedy,
+            'pseudo_likelihood': pl
+        })
+
+    df = pd.DataFrame(data)
+
+    # Sorting
+    avg_score_pos1 = df.groupby('mut_aa1')['truth'].mean()
+    avg_score_pos2 = df.groupby('mut_aa2')['truth'].mean()
+    sorted_aa_pos1 = avg_score_pos1.sort_values().index.tolist()
+    sorted_aa_pos2 = avg_score_pos2.sort_values().index.tolist()
+
+    # Scores to plot
+    scores = [
+        ('truth', 'Analytic ΔlogP'),
+        ('SD', 'Shared Decoding'),
+        ('MM', 'Masked Marginal'),
+        ('WTMM', 'Wildtype Context'),
+        ('PC', 'Path Chaining'),
+        ('generation_likelihood', 'Gen Likelihood'),
+        ('generation_likelihood_greedy_path', 'Greedy Gen Likelihood'),
+        ('pseudo_likelihood', 'Pseudo Likelihood')
+    ]
+    fig, axes = plt.subplots(3, len(scores), figsize=(5*len(scores), 15), gridspec_kw={'height_ratios': [3, 2, 0.5]})
+
+    for i, (score_key, score_label) in enumerate(scores):
+        # Row 1: Heatmap
+        pivot = df.pivot_table(index='mut_aa1', columns='mut_aa2', values=score_key, aggfunc='first')
+        pivot = pivot.reindex(index=sorted_aa_pos1, columns=sorted_aa_pos2)
+        sns.heatmap(pivot, cmap='viridis', cbar_kws={'label': score_label}, ax=axes[0, i], square=True)
+        axes[0, i].set_title(score_label)
+        axes[0, i].set_xlabel('Mutated AA at Position 2')
+        axes[0, i].set_ylabel('Mutated AA at Position 1')
+        axes[0, i].set_xticks([x + 0.5 for x in range(len(sorted_aa_pos2))])
+        axes[0, i].set_yticks([y + 0.5 for y in range(len(sorted_aa_pos1))])
+        tick_labels_x = format_tick_labels(sorted_aa_pos2, original_aa2)
+        tick_labels_y = format_tick_labels(sorted_aa_pos1, original_aa1)
+        axes[0, i].set_xticklabels(tick_labels_x, rotation=90)
+        axes[0, i].set_yticklabels(tick_labels_y, rotation=0)
+        # Bold original amino acids
+        for j, label in enumerate(axes[0, i].get_xticklabels()):
+            if sorted_aa_pos2[j] == original_aa2:
+                label.set_fontweight('bold')
+        for j, label in enumerate(axes[0, i].get_yticklabels()):
+            if sorted_aa_pos1[j] == original_aa1:
+                label.set_fontweight('bold')
+
+        # Row 2: Density or scatter
+        if score_key == 'truth':
+            x_vals = df[score_key].values
+            try:
+                kde = gaussian_kde(x_vals)
+                x_grid = np.linspace(min(x_vals), max(x_vals), 200)
+                density = kde(x_grid)
+            except Exception:
+                jitter = np.random.normal(0, 1e-10, size=len(x_vals))
+                kde = gaussian_kde(x_vals + jitter)
+                x_grid = np.linspace(min(x_vals), max(x_vals), 200)
+                density = kde(x_grid)
+            axes[1, i].plot(x_grid, density, color='blue')
+            axes[1, i].fill_between(x_grid, density, alpha=0.3, color='blue')
+            axes[1, i].set_title('Density of Analytic ΔlogP')
+            axes[1, i].set_xlabel('Analytic ΔlogP')
+            axes[1, i].set_ylabel('Density')
+        else:
+            x_vals = df['truth'].values
+            y_vals = df[score_key].values
+            axes[1, i].scatter(x_vals, y_vals, alpha=0.6, s=10)
+            axes[1, i].set_title(f'Scatter: {score_label} vs Analytic ΔlogP')
+            axes[1, i].set_xlabel('Analytic ΔlogP')
+            axes[1, i].set_ylabel(score_label)
+
+        # Row 3: Spearman correlation
+        if score_key == 'truth':
+            corr = 1.0
+            axes[2, i].text(0.5, 0.5, f'Spearman r = {corr:.4f}', ha='center', va='center', fontsize=12)
+            axes[2, i].axis('off')
+        else:
+            x_vals = df['truth'].values
+            y_vals = df[score_key].values
+            corr, pval = spearmanr(x_vals, y_vals)
+            top_n = 10
+            top_n_subset = df.nlargest(top_n, score_key)
+            avg_truth_top_n = top_n_subset['truth'].mean()
+            text = f'Spearman r = {corr:.4f}\\nAvg Analytic ΔlogP (top {top_n}) = {avg_truth_top_n:.4f}'
+            axes[2, i].text(0.5, 0.5, text, ha='center', va='center', fontsize=12)
+            axes[2, i].axis('off')
+
+    plt.suptitle(f"{original_sequence} \\nPositions {pos1}-{pos2}\\nSorted by: Analytic ΔlogP")
+    plt.tight_layout(rect=[0, 0, 1, 0.95])
+    if images_dir is None:
+        plt.savefig('two_site_spectrum.png')
+    else:
+        os.makedirs(images_dir, exist_ok=True)
+        plt.savefig(os.path.join(images_dir, f"two_site_spectrum_{original_sequence}_{pos1}-{pos2}.png"))
+    plt.close()
+    
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+def main():
+    
+    
+    parser = argparse.ArgumentParser(description="Train Masked Language Model on Energy Distribution")
+    parser.add_argument('--model_type', type=str, default='mlm', choices=['mlm'],
+                      help='Type of model to train')
+    parser.add_argument('--mlm_embedding_dim', type=int, default=128,
+                      help='Embedding dimension for MLM')
+    parser.add_argument('--mlm_hidden_dim', type=int, default=256,
+                      help='Hidden dimension for MLM')
+    parser.add_argument('--mlm_num_layers', type=int, default=4,
+                      help='Number of layers for MLM')
+    
+    parser.add_argument('--uniform_masking', action='store_true',
+                      help='Use uniform random number of masks (0 to L)')
+    
+    parser.add_argument('--mlm_test_prob', type=float, default=0.15,
+                      help='Probability of masking a token')
+    parser.add_argument('--mlm_mask_token_ratio', type=float, default=1.0,
+                      help='Fraction of masked tokens to replace with [MASK]')
+    parser.add_argument('--mlm_random_token_ratio', type=float, default=0.0,
+                      help='Fraction of masked tokens to replace randomly')
+    
+    parser.add_argument('--num_epochs', type=int, default=30,
+                      help='Number of training epochs')
+    parser.add_argument('--num_samples', type=int, default=10000,
+                      help='Number of samples to train on')
+    parser.add_argument('--seed', type=int, default=0,
+                      help='Random seed')
+    
+    parser.add_argument('--gpu', type=int, default=0,
+                      help='GPU num to use')
+    
+    parser.add_argument('--distribution_parameter', type=float, default=3.0,
+                      help='Distribution parameter')
+    
+    parser.add_argument('--something_or_nothing_fitness', action='store_true',
+                      help='If true, fitness is unrelated to likelihood, unless likeihood is below a threshold')
+    
+    parser.add_argument('--death_threshold', type=float, default=-10,
+                      help='If likelihood is below this threshold, fitness is dead fitness')
+    
+    parser.add_argument('--dead_fitness', type=float, default=-20,
+                      help='Fitness of dead proteins')
+
+    
+    parser.add_argument('--tiny_space', action='store_true',
+                      help='Very small sequence space, L=2, alphabet_size=2')
+    
+    parser.add_argument('--tiny_space_probabilities', type=str, default=None,
+                      help='Probabilities for the tiny space, comma separated')
+    
+    args = parser.parse_args()
+
+    # Set all random seeds for reproducibility
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
+    random.seed(args.seed)
+    
+    # Make PyTorch operations deterministic
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+    
+    # Set CUDA random seed if using GPU
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(args.seed)
+        torch.cuda.manual_seed_all(args.seed)
+    
+    # Create a generator for reproducible shuffling
+    g = torch.Generator()
+    g.manual_seed(args.seed)
+    
+    # Generate Energy dist
+    if args.tiny_space:
+        L = 2
+        alphabet_size = 2
+    else:
+        L = 10
+        alphabet_size = 5
+        
+    energy_params = generate_energy_distribution( #Energy distribution is deterministic with seed
+        L=L,
+        alphabet_size=alphabet_size,
+        upper_range=args.distribution_parameter
+    )
+    
+    train_ratio = 0.9
+    if args.tiny_space:
+        train_ratio = 1.0
+        if args.tiny_space_probabilities is not None:
+            energy_params['probabilities'] = np.array([float(x) for x in args.tiny_space_probabilities.split(',')])
+        else:
+            energy_params['probabilities'] = np.array([0.25, 0.25, 0.25, 0.25])
+
+    
+
+    validation_set = sample_sequences(energy_params, 100)
+    validation_set_log_p = [sequence_log_likelihood(seq, energy_params) for seq in validation_set]
+    
+    # Train model
+    model = train(energy_params, model_type=args.model_type,
+                 num_epochs=args.num_epochs,
+                 num_samples=args.num_samples,
+                 mlm_embedding_dim=args.mlm_embedding_dim,
+                 mlm_hidden_dim=args.mlm_hidden_dim,
+                 mlm_num_layers=args.mlm_num_layers,
+                 mlm_test_prob=args.mlm_test_prob,
+                 mlm_mask_token_ratio=args.mlm_mask_token_ratio,
+                 mlm_random_token_ratio=args.mlm_random_token_ratio,
+                 gpu=args.gpu,
+                 uniform_masking=args.uniform_masking,
+                 generator=g,
+                 train_ratio=train_ratio)
+
+
+    
+    
+    # Validation
+    if args.tiny_space:
+        device = next(model.parameters()).device
+        verbose = False
+
+        print("All sequence likelihoods, seed:", args.seed, flush=True)
+        seq_likehoods = {
+            (0,0): energy_params['probabilities'][0],
+            (0,1): energy_params['probabilities'][1],
+            (1,0): energy_params['probabilities'][2],
+            (1,1): energy_params['probabilities'][3]
+        }
+        print(f"0,0: {seq_likehoods[(0,0)]}")
+        print(f"0,1: {seq_likehoods[(0,1)]}")
+        print(f"1,0: {seq_likehoods[(1,0)]}")
+        print(f"1,1: {seq_likehoods[(1,1)]}")
+        if verbose:
+            print("All generation likelihoods")
+            print(f"0,0: {np.exp(generation_likelihood_all_paths(model, [0,0], alphabet_size, device))}")
+            print(f"0,1: {np.exp(generation_likelihood_all_paths(model, [0,1], alphabet_size, device))}")
+            print(f"1,0: {np.exp(generation_likelihood_all_paths(model, [1,0], alphabet_size, device))}")
+            print(f"1,1: {np.exp(generation_likelihood_all_paths(model, [1,1], alphabet_size, device))}")
+
+        
+            print("all possible masked prompts")
+
+        true_conditional_probs = {
+            (0,0,0): [0,0],
+            (0,0,1): [0,0],
+            (0,1,0): [0,0],
+            (0,1,1): [0,0],
+            (0,2,0): [0,0],
+            (0,2,1): [0,0],
+            (1,0,0): [0,0],
+            (1,0,1): [0,0],
+            (1,1,0): [0,0],
+            (1,1,1): [0,0],
+            (1,2,0): [0,0],
+            (1,2,1): [0,0],
+            (2,0,0): [0,0],
+            (2,0,1): [0,0],
+            (2,1,0): [0,0],
+            (2,1,1): [0,0],
+            (2,2,0): [0,0],
+            (2,2,1): [0,0]
+        }
+
+
+        for i in range(3):
+            for j in range(3):
+                possible_pos0 = [0,1] if i == 2 else [i]
+                possible_pos1 = [0,1] if j == 2 else [j]
+
+                true_marginals_pos0 = [0,0]
+                true_marginals_pos1 = [0,0]
+
+                for pos0 in possible_pos0:
+                    for pos1 in possible_pos1:
+                        true_marginals_pos0[pos0] += energy_params['probabilities'][pos0 * 2 + pos1]
+                        true_marginals_pos1[pos1] += energy_params['probabilities'][pos0 * 2 + pos1]
+
+                true_marginals_pos0 = [float(x / sum(true_marginals_pos0)) for x in true_marginals_pos0]
+                true_marginals_pos1 = [float(x / sum(true_marginals_pos1)) for x in true_marginals_pos1]
+
+                true_conditional_probs[(i,j,0)] = true_marginals_pos0
+                true_conditional_probs[(i,j,1)] = true_marginals_pos1
+
+        
+        for i in range(3):
+            for j in range(3):
+
+                #2 represents a masked position, meaning it can be 0 or 1
+
+                prompt = [i, j]
+                logits = model(torch.tensor(prompt).unsqueeze(0).to(device)) 
+                logits = logits.squeeze(0)
+                probabilities_0 = F.softmax(logits[0], dim=-1)
+                probabilities_1 = F.softmax(logits[1], dim=-1)
+
+                
+
+                prompt_str = f"[{prompt[0] if prompt[0] != 2 else '?'}, {prompt[1] if prompt[1] != 2 else '?'}]"
+
+                if verbose:
+                    print()
+
+                print(f"{prompt_str}\t[{probabilities_0[0]:.4f}, {probabilities_0[1]:.4f}]\t[{probabilities_1[0]:.4f}, {probabilities_1[1]:.4f}]", flush=True)
+                print(f"\t[{true_conditional_probs[(i,j,0)][0]:.4f}, {true_conditional_probs[(i,j,0)][1]:.4f}]\t[{true_conditional_probs[(i,j,1)][0]:.4f}, {true_conditional_probs[(i,j,1)][1]:.4f}]", flush=True)
+
+                only_one_masked = (prompt[0] == 2) != (prompt[1] == 2)
+                if only_one_masked:
+                    hypothesis_ans = [0,0]
+                    masked_pos = 0 if prompt[0] == 2 else 1
+
+                    temp = true_conditional_probs[(i,j,masked_pos)]
+                    if masked_pos == 0:
+                        alt1 = true_conditional_probs[(0,2,1)]
+                        alt2 = true_conditional_probs[(1,2,1)]
+
+                        hypothesis_ans[0] = alt1[0] * temp[0] + alt2[0] * temp[1]
+                        hypothesis_ans[1] = alt1[1] * temp[0] + alt2[1] * temp[1]
+
+                    else:
+                        alt1 = true_conditional_probs[(2,0,0)]
+                        alt2 = true_conditional_probs[(2,1,0)]
+
+                        hypothesis_ans[0] = alt1[0] * temp[0] + alt2[0] * temp[1]
+                        hypothesis_ans[1] = alt1[1] * temp[0] + alt2[1] * temp[1]
+                    
+                    if verbose:
+                        print(f"\t{"\t\t\t" if masked_pos == 0 else ""}[{hypothesis_ans[0]:.4f}, {hypothesis_ans[1]:.4f}]")
+
+
+
+
+
+                        
+                        
+
+
+
+
+        exit()
+
+
+
+    if args.model_type == 'markov':
+        exit()
+    else:
+        if args.something_or_nothing_fitness:
+            fitness_distribution_params = generate_energy_distribution(
+                L=L,
+                alphabet_size=alphabet_size,
+                upper_range=args.distribution_parameter
+            )
+        else:
+            fitness_distribution_params = None
+
+        
+        positions_to_be_kept_masked=[0, 1, 2, 3, 4]
+
+
+        for fitness_noise_level in [0.0]:
+            for m in range(L - len(positions_to_be_kept_masked)):
+                assay_scoring(model, energy_params, args, mutations=m+1, num_samples=100, fitness_noise_level=fitness_noise_level, fitness_distribution_params=fitness_distribution_params, positions_to_be_kept_masked=positions_to_be_kept_masked)
+        exit()
+        
+
+        #validate_mlm(model, energy_params, args, num_samples=2)
+        print("Single Sequence Scoring", flush=True)
+        results = single_sequence_scoring(model, energy_params, args, num_samples=1000, fitness_distribution_params=fitness_distribution_params)
+        print("Finished Single Sequence Scoring", flush=True)
+        gen_ll_mean_square_error = np.mean((results['truth'] - results['scores']['generation_likelihood'])**2)
+        gen_ll_greedy_mean_square_error = np.mean((results['truth'] - results['scores']['generation_likelihood_greedy_path'])**2)
+        pl_mean_square_error = np.mean((results['truth'] - results['scores']['pseudo_likelihood'])**2)
+        print(f"Generation Likelihood Mean Square Error: {gen_ll_mean_square_error:.4f}")
+        print(f"Greedy Generation Likelihood Mean Square Error: {gen_ll_greedy_mean_square_error:.4f}")
+        print(f"Pseudo Likelihood Mean Square Error: {pl_mean_square_error:.4f}")
+        print(f"Generation Likelihood Correlation: {results['correlations']['generation_likelihood']:.4f}")
+        print(f"Greedy Generation Likelihood Correlation: {results['correlations']['generation_likelihood_greedy_path']:.4f}")
+        print(f"Pseudo Likelihood Correlation: {results['correlations']['pseudo_likelihood']:.4f}")
+
+        #Create subplot of scatter plot of generation likelihood and pseudo likelihood vs truth
+        plt.figure(figsize=(20, 5))
+        
+        # Get min and max for consistent y = x line
+        min_val = min(min(results['truth']), min(results['scores']['generation_likelihood']),
+                    min(results['scores']['generation_likelihood_greedy_path']),
+                    min(results['scores']['pseudo_likelihood']))
+        max_val = max(max(results['truth']), max(results['scores']['generation_likelihood']),
+                    max(results['scores']['generation_likelihood_greedy_path']),
+                    max(results['scores']['pseudo_likelihood']))
+
+        # Create the plots
+        plt.figure(figsize=(20, 5))
+
+        # Subplot 1
+        plt.subplot(1, 3, 1)
+        plt.scatter(results['truth'], results['scores']['generation_likelihood'], label=f"Generation Likelihood corr: {results['correlations']['generation_likelihood']:.4f}", s=1)
+        plt.plot([min_val, max_val], [min_val, max_val], 'k--', label='y = x')  # Dashed y = x line
+        plt.xlabel('Truth')
+        plt.ylabel('Score')
+        plt.legend()
+
+        # Subplot 2
+        plt.subplot(1, 3, 2)
+        plt.scatter(results['truth'], results['scores']['generation_likelihood_greedy_path'], label=f"Greedy Generation Likelihood corr: {results['correlations']['generation_likelihood_greedy_path']:.4f}", s=1)
+        plt.plot([min_val, max_val], [min_val, max_val], 'k--', label='y = x')
+        plt.xlabel('Truth')
+        plt.ylabel('Score')
+        plt.legend()
+
+        # Subplot 3
+        plt.subplot(1, 3, 3)
+        plt.scatter(results['truth'], results['scores']['pseudo_likelihood'], label=f"Pseudo Likelihood corr: {results['correlations']['pseudo_likelihood']:.4f}", s=1)
+        plt.plot([min_val, max_val], [min_val, max_val], 'k--', label='y = x')
+        plt.xlabel('Truth')
+        plt.ylabel('Score')
+        plt.legend()
+
+        # Save figure
+        plt.savefig('single_sequence_scoring.png')
+
+        exit()
+
+        for i in range(10):
+            visualize_two_site_spectrum(model, energy_params, images_dir=f"images")
+
+        
+
+
+if __name__ == "__main__":
+    main()
