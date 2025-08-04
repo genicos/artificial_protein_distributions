@@ -13,7 +13,7 @@ import itertools
 import matplotlib.pyplot as plt
 import os
 
-from train import train
+from train import train_density
 from validation import single_sequence_scoring
 
 
@@ -24,7 +24,6 @@ from validation import single_sequence_scoring
 def main():
     
     print("Starting main", flush=True)
-    exit()
 
     parser = argparse.ArgumentParser(description="Train Masked Language Model on Energy Distribution")
 
@@ -80,7 +79,7 @@ def main():
 
 
     # Train model
-    model = train(energy_params,
+    model = train_density(energy_params,
                 num_epochs=args.num_epochs,
                 num_samples=args.num_samples,
                 gpu=args.gpu,

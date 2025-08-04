@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --cluster=kraken
+#SBATCH --cluster=whale
 #SBATCH --partition=long
 #SBATCH --account=researchers
 #SBATCH --job-name=quick_test
@@ -12,4 +12,4 @@
 
 
 
-python3 main.py --seed 0 --num_epochs 6 --num_samples 10000 1> OUT 2> ERR
+python3 main.py --seed 0 --num_epochs 6 --num_samples 100000 1> OUT 2> ERR

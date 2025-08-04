@@ -4,7 +4,7 @@ import torch
 import numpy as np
 
 class EnergyDataset(Dataset):
-    def __init__(self, energy_params, sequences=None, num_samples=10000, test_prob=0.15, mlm=False,
+    def __init__(self, energy_params, sequences=None, num_samples=10000, test_prob=0.15, mlm=True,
                  mask_token_ratio=0.8, random_token_ratio=0.1, uniform_masking=False):
         self.sequences = sequences if sequences is not None else sample_sequences(energy_params, num_samples)
         self.alphabet_size = energy_params['alphabet_size']
@@ -82,10 +82,10 @@ def get_loaders(
     train_ratio=0.9,
     num_samples=10000,
     test_prob=0.15,  # Research shows this can be increased for larger models 
-    mlm=False,
+    mlm=True,
     mask_token_ratio=0.8,  # BERT's original 80-10-10 strategy 
     random_token_ratio=0.1,  # 10% random token replacement 
-    uniform_masking=False,
+    uniform_masking=True,
     generator=None  # Add generator parameter for reproducibility
 ):
     """Create data loaders with configurable BERT-style masking ratios.

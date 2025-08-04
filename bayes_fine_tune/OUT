@@ -1,0 +1,10 @@
+Starting main
+Single Sequence Scoring
+SingleSeqScoring	seed=0	generation_likelihood	0.9667	1.7422	generation_likelihood_greedy_path	0.9649	1.8105	pseudo_likelihood	0.9623	2.0594	
+Finished Single Sequence Scoring
+Generation Likelihood Mean Square Error: 1.7422
+Greedy Generation Likelihood Mean Square Error: 1.8105
+Pseudo Likelihood Mean Square Error: 2.0594
+Generation Likelihood Correlation: 0.9667
+Greedy Generation Likelihood Correlation: 0.9649
+Pseudo Likelihood Correlation: 0.9623
